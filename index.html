@@ -1,0 +1,269 @@
+```html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Image Background Remover (Client + Server AI)</title>
+  <style>
+    body{font-family:Inter, Arial, sans-serif; background:#071122;color:#e6eef7;margin:0;padding:20px}
+    .card{max-width:900px;margin:0 auto;background:rgba(255,255,255,0.03);padding:16px;border-radius:10px}
+    input[type=file]{display:block;margin-bottom:8px}
+    button{padding:8px 12px;border-radius:8px;border:0;cursor:pointer}
+    .preview{margin-top:12px}
+    img{max-width:100%;height:auto;border-radius:6px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Upload image — server-side AI will remove background</h2>
+    <p>Choose file and press <strong>Remove Background (Server)</strong>. Server returns a transparent PNG.</p>
+
+    <input id="file" type="file" accept="image/*" />
+    <div style="display:flex;gap:8px">
+      <button id="btn">Remove Background (Server)</button>
+      <select id="serverOption">
+        <option value="remote">Use remove.bg API (remote)</option>
+        <option value="local">Use local rembg server (if running)</option>
+      </select>
+    </div>
+
+    <div id="status" class="small" style="margin-top:8px;color:#cbd5e1">Idle</div>
+
+    <div class="preview" id="preview"></div>
+  </div>
+
+<script>
+const fileInput = document.getElementById('file');
+const btn = document.getElementById('btn');
+const status = document.getElementById('status');
+const preview = document.getElementById('preview');
+const serverOption = document.getElementById('serverOption');
+
+btn.addEventListener('click', async ()=>{
+  const f = fileInput.files[0];
+  if(!f){ alert('Choose an image first'); return; }
+  status.innerText = 'Uploading...';
+  preview.innerHTML = '';
+
+  const form = new FormData();
+  form.append('image_file', f);
+  // choose endpoint by option
+  const endpoint = serverOption.value === 'local' ? '/local/remove' : '/remove';
+
+  try{
+    const res = await fetch(endpoint, { method: 'POST', body: form });
+    if(!res.ok) throw new Error('Server error: '+res.status);
+    const blob = await res.blob();
+    // show result
+    const url = URL.createObjectURL(blob);
+    const img = document.createElement('img');
+    img.src = url;
+    preview.appendChild(img);
+
+    // create download link
+    const a = document.createElement('a');
+    a.href = url; a.download = 'bg-removed.png';
+    a.innerText = 'Download PNG';
+    a.style.display = 'inline-block';
+    a.style.marginTop = '8px';
+    preview.appendChild(a);
+
+    status.innerText = 'Done';
+  }catch(err){
+    console.error(err);
+    status.innerText = 'Error: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
+```
+
+---
+
+### 2) Server (Node.js) — `server.js`
+
+This server receives uploaded images and either forwards them to remove.bg (recommended) or returns an error if key not set.
+
+```js
+// server.js
+const express = require('express');
+const multer = require('multer');
+const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const upload = multer({ dest: 'uploads/' });
+const REMOVE_BG_KEY = process.env.REMOVE_BG_API_KEY || '';
+
+// serve the frontend
+app.use('/', express.static(path.join(__dirname)));
+
+app.post('/remove', upload.single('image_file'), async (req, res) => {
+  if(!REMOVE_BG_KEY){
+    return res.status(500).send('Server not configured with REMOVE_BG_API_KEY');
+  }
+  try{
+    const filePath = req.file.path;
+    const form = new FormData();
+    form.append('image_file', fs.createReadStream(filePath));
+    form.append('size','auto');
+
+    const response = await fetch('https://api.remove.bg/v1.0/removebg', {
+      method: 'POST',
+      headers: { 'X-Api-Key': REMOVE_BG_KEY },
+      body: form
+    });
+
+    if(!response.ok){
+      const txt = await response.text();
+      console.error('remove.bg error', response.status, txt);
+      return res.status(502).send('remove.bg error: ' + response.status);
+    }
+
+    const buffer = await response.buffer();
+    res.set('Content-Type','image/png');
+    res.send(buffer);
+
+    // cleanup
+    fs.unlink(filePath, ()=>{});
+  }catch(err){
+    console.error(err);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// optional local rembg proxy endpoint: forwards to a local python rembg service on port 5000
+app.post('/local/remove', upload.single('image_file'), async (req,res)=>{
+  // This endpoint assumes you have the Python rembg server running separately.
+  try{
+    const filePath = req.file.path;
+    const form = new FormData();
+    form.append('image_file', fs.createReadStream(filePath));
+
+    const response = await fetch('http://127.0.0.1:5000/remove', { method:'POST', body: form });
+    if(!response.ok){
+      const txt = await response.text();
+      console.error('local rembg error', response.status, txt);
+      return res.status(502).send('local rembg error');
+    }
+    const buffer = await response.buffer();
+    res.set('Content-Type','image/png');
+    res.send(buffer);
+    fs.unlink(filePath, ()=>{});
+  }catch(err){
+    console.error(err);
+    res.status(500).send('Internal server error');
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=>console.log('Server listening on', PORT));
+```
+
+**package.json** (minimal)
+
+```json
+{
+  "name":"bg-remover-server",
+  "version":"1.0.0",
+  "type":"module",
+  "scripts":{
+    "start":"node server.js"
+  },
+  "dependencies":{
+    "express":"^4.18.0",
+    "multer":"^1.4.4",
+    "node-fetch":"^2.6.7",
+    "form-data":"^4.0.0",
+    "dotenv":"^16.0.0"
+  }
+}
+```
+
+**.env**
+
+```
+REMOVE_BG_API_KEY=your_remove_bg_key_here
+PORT=3000
+```
+
+---
+
+### 3) Local open-source server (Python + rembg)
+
+If you prefer not to use a paid API, install Python and `rembg` and run this small Flask server. It removes background locally.
+
+```py
+# rembg_server.py
+from flask import Flask, request, send_file
+from rembg import remove
+from PIL import Image
+import io
+
+app = Flask(__name__)
+
+@app.route('/remove', methods=['POST'])
+def remove_bg():
+    f = request.files.get('image_file')
+    if not f:
+        return 'no file', 400
+    input_bytes = f.read()
+    output_bytes = remove(input_bytes)
+    return send_file(io.BytesIO(output_bytes), mimetype='image/png', as_attachment=False, download_name='out.png')
+
+if __name__ == '__main__':
+    app.run(port=5000)
+```
+
+Install requirements:
+
+```bash
+python -m pip install rembg flask pillow
+```
+
+Then run:
+
+```bash
+python rembg_server.py
+```
+
+Now the Node.js frontend can call `/local/remove` (the Node server proxies to `http://127.0.0.1:5000/remove`) OR you can skip Node entirely and serve the `index.html` directly and change fetch target to `http://127.0.0.1:5000/remove`.
+
+---
+
+## How to run (quick steps)
+
+**Remote API (recommended)**
+
+1. Put the `index.html` and `server.js` + `package.json` into a folder.
+2. Create `.env` with `REMOVE_BG_API_KEY=...` (get key from remove.bg or similar provider).
+3. `npm install`
+4. `npm start`
+5. Open `http://localhost:3000` and upload an image.
+
+**Local rembg (no API key)**
+
+1. Install Python and `rembg`: `pip install rembg flask pillow`
+2. Run `python rembg_server.py` (listens on port 5000).
+3. Serve `index.html` (double-click or `python -m http.server 8000`) and choose the <em>local</em> server option in the UI.
+
+---
+
+## Notes & tips
+
+- **remove.bg** gives excellent results but is paid. Use the free trial to test.
+- **rembg** is open-source and works well for many photos, but may be slower and needs a machine with enough RAM/CPU (or GPU if you set it up with GPU acceleration).
+- If you want a production setup, consider adding request size limits, authentication, rate-limiting, and background job processing for large images.
+
+---
+
+If you want, I can now:
+- add **edge-refinement smoothing** on the frontend (post-process mask to smooth jagged edges), or
+- convert the Node server to a single Dockerfile for easy deployment, or
+- adapt the frontend to work purely with the Python rembg server (skip Node entirely).
+
+Which of these next steps do you want? Or should I proceed and add a Dockerfile for the Node + proxy to the rembg server?
